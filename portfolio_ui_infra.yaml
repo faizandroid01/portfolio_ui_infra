@@ -1,0 +1,195 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Portfolio Blog Frontend - S3 + CloudFront + IAM user for GitHub Actions. Free tier eligible.
+
+Parameters:
+
+  BucketName:
+    Type: String
+    Default: mdfaizahmed-portfolio
+    Description: >
+      S3 bucket name - must be globally unique across all AWS accounts.
+      If this fails, try adding your name or a number e.g. mdfaizahmed-portfolio-2025
+
+  BackendAPIURL:
+    Type: String
+    Default: http://54.164.228.48:8080
+    Description: Your EC2 backend URL - used as VITE_API_BASE_URL reference in outputs
+
+Resources:
+
+  # -- S3 Bucket -------------------------------
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      # Block all public access - CloudFront is the only entry point
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: portfolio-frontend
+        - Key: Project
+          Value: portfolio-blog
+
+  # -- CloudFront Origin Access Control --------
+  # OAC replaces the older OAI method - more secure
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: portfolio-frontend-oac
+        Description: OAC for Portfolio Frontend S3 bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # -- CloudFront Distribution ------------------
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Portfolio Blog Frontend
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+        # SPA routing fix - all 403/404 from S3 serve index.html with 200
+        # This makes React Router work when user refreshes or pastes a URL
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
+      Tags:
+        - Key: Name
+          Value: portfolio-frontend-cdn
+        - Key: Project
+          Value: portfolio-blog
+
+  # -- S3 Bucket Policy -------------------------
+  # Allows only CloudFront (via OAC) to read from S3
+  # GitHub Actions IAM user gets separate write access below
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${BucketName}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}
+
+  # -- IAM User for GitHub Actions -------------
+  GitHubActionsUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: github-actions-frontend
+      Tags:
+        - Key: Purpose
+          Value: GitHub Actions CI/CD for frontend deployment
+        - Key: Project
+          Value: portfolio-blog
+
+  # Minimal permissions - only what GitHub Actions needs
+  GitHubActionsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: github-actions-frontend-policy
+      Users:
+        - !Ref GitHubActionsUser
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3DeployAccess
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:DeleteObject
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource:
+              - !Sub arn:aws:s3:::${BucketName}
+              - !Sub arn:aws:s3:::${BucketName}/*
+          - Sid: CloudFrontInvalidation
+            Effect: Allow
+            Action:
+              - cloudfront:CreateInvalidation
+              - cloudfront:GetDistribution
+            Resource: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}
+
+  # Access key for the IAM user - used in GitHub secrets
+  GitHubActionsAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref GitHubActionsUser
+
+Outputs:
+
+  BucketName:
+    Description: S3 bucket name - use as AWS_S3_BUCKET in GitHub secrets
+    Value: !Ref FrontendBucket
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID - use as AWS_CLOUDFRONT_ID in GitHub secrets
+    Value: !Ref FrontendDistribution
+
+  CloudFrontURL:
+    Description: Your frontend URL - site will be live here after first deploy
+    Value: !Sub https://${FrontendDistribution.DomainName}
+
+  CloudFrontDomain:
+    Description: CloudFront domain - add this to backend CORS_ALLOWED_ORIGINS
+    Value: !GetAtt FrontendDistribution.DomainName
+
+  GitHubActionsAccessKeyId:
+    Description: AWS_ACCESS_KEY_ID for GitHub secrets
+    Value: !Ref GitHubActionsAccessKey
+
+  GitHubActionsSecretKey:
+    Description: AWS_SECRET_ACCESS_KEY for GitHub secrets
+    Value: !GetAtt GitHubActionsAccessKey.SecretAccessKey
+
+  ViteAPIBaseURL:
+    Description: VITE_API_BASE_URL for GitHub secrets - your backend URL
+    Value: !Ref BackendAPIURL
+
+  AllGitHubSecrets:
+    Description: Summary of all 5 secrets to add to prime-engineer-hub repo
+    Value: !Sub >
+      AWS_ACCESS_KEY_ID=${GitHubActionsAccessKey},
+      AWS_SECRET_ACCESS_KEY=see GitHubActionsSecretKey output,
+      AWS_S3_BUCKET=${BucketName},
+      AWS_CLOUDFRONT_ID=${FrontendDistribution},
+      VITE_API_BASE_URL=${BackendAPIURL}
